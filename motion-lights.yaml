@@ -1,0 +1,102 @@
+blueprint:
+  name: Motion-activated lights
+  description: >-
+    Turn lights on with presence (unless manually switched off recently),
+    and off after all sensors have been clear for N minutes.
+  domain: automation
+  input:
+    presence_sensors:
+      name: Presence sensors
+      selector:
+        entity:
+          domain: binary_sensor
+          multiple: true
+    target_lights:
+      name: Lights / switches
+      selector:
+        entity:
+          domain: [light, switch]
+          multiple: true
+    off_delay:
+      name: Turn off after clear for (minutes)
+      default: 5
+      selector:
+        number:
+          min: 1
+          max: 120
+          unit_of_measurement: min
+    manual_grace:
+      name: Manual-off grace period (seconds)
+      description: Don't turn back on if lights were switched off this recently.
+      default: 5
+      selector:
+        number:
+          min: 0
+          max: 300
+          unit_of_measurement: s
+    on_conditions:
+      name: Extra conditions to turn ON
+      default: []
+      selector:
+        condition: {}
+    off_conditions:
+      name: Extra conditions to turn OFF
+      description: e.g. door must be open
+      default: []
+      selector:
+        condition: {}
+
+mode: restart
+
+variables:
+  presence_sensors: !input presence_sensors
+  target_lights: !input target_lights
+  off_delay: !input off_delay
+  manual_grace: !input manual_grace
+
+triggers:
+  - trigger: state
+    entity_id: !input presence_sensors
+    to: "on"
+    id: motion
+  - trigger: state
+    entity_id: !input presence_sensors
+    to: "off"
+    for:
+      minutes: !input off_delay
+    id: clear
+
+actions:
+  - choose:
+      - conditions:
+          - condition: trigger
+            id: motion
+          - condition: template
+            value_template: >-
+              {% set lights = expand(target_lights) %}
+              {{ lights | selectattr('state', 'eq', 'on') | list | count > 0
+                 or lights | selectattr('last_changed', 'gt',
+                      now() - timedelta(seconds=manual_grace)) | list | count == 0 }}
+          - condition: and
+            conditions: !input on_conditions
+        sequence:
+          - action: homeassistant.turn_on
+            target:
+              entity_id: "{{ target_lights }}"
+
+      - conditions:
+          - condition: trigger
+            id: clear
+          # With multiple sensors, make sure ALL have been clear for the full delay
+          - condition: template
+            value_template: >-
+              {% set sensors = expand(presence_sensors) %}
+              {{ sensors | selectattr('state', 'eq', 'on') | list | count == 0
+                 and sensors | selectattr('last_changed', 'gt',
+                      now() - timedelta(minutes=off_delay)) | list | count == 0 }}
+          - condition: and
+            conditions: !input off_conditions
+        sequence:
+          - action: homeassistant.turn_off
+            target:
+              entity_id: "{{ target_lights }}"
