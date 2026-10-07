@@ -4,7 +4,8 @@ blueprint:
     Turn lights on with presence (unless manually switched off recently),
     and off after all sensors have been clear for N minutes.
     Optional: button gestures to lock lights on (no auto-off) or off (ignore motion).
-    Repeat the same gesture to unlock. Lock state resets to auto on restart.
+    Repeat the same gesture to unlock. Running the automation manually resets the lock.
+    Lock state resets to auto on restart.
   domain: automation
   input:
     presence_sensors:
@@ -117,6 +118,8 @@ blueprint:
 mode: queued
 max: 10
 max_exceeded: silent
+trace:
+  stored_traces: 20
 
 variables:
   presence_sensors: !input presence_sensors
@@ -165,13 +168,25 @@ actions:
            else 'auto' }}
 
   - choose:
+      # ---- Manual run = reset lock to auto ----
+      - conditions:
+          - condition: template
+            value_template: "{{ trigger.platform is none }}"
+        sequence:
+          - if: "{{ lock_mode != 'auto' }}"
+            then:
+              - action: scene.delete
+                target:
+                  entity_id: "scene.{{ lock_base }}_{{ lock_mode }}"
+
       # ---- Lock gestures ----
       - conditions:
           - condition: trigger
             id: [lock_on, lock_off]
           - condition: template
             value_template: >-
-              {{ trigger.to_state.attributes.event_type ==
+              {{ trigger.to_state is not none and trigger.from_state is not none
+                 and trigger.to_state.attributes.event_type ==
                  (lock_on_action if trigger.id == 'lock_on' else lock_off_action) }}
           # Ignore duplicate events (some switches send each multi-press twice)
           - condition: template
