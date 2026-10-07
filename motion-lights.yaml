@@ -97,7 +97,7 @@ blueprint:
           name: Flash feedback
           description: >-
             Flash lights when the lock changes.
-            Lock on = 1 green, lock off = 2 red,
+            Lock on = 2 green blinks, lock off = 2 red blinks,
             unlock = 1 blink in the light's own color.
             Non-color lights and switches just blink.
           default: true
@@ -184,7 +184,7 @@ actions:
               wanted: "{{ 'locked_on' if trigger.id == 'lock_on' else 'locked_off' }}"
               new_mode: "{{ 'auto' if lock_mode == wanted else wanted }}"
               flash_color: "{{ [0, 255, 0] if new_mode == 'locked_on' else [255, 0, 0] }}"
-              flash_count: "{{ 1 if new_mode == 'locked_on' else 2 }}"
+              flash_count: 2
               flash_lights: >-
                 {{ expand(feedback_lights) | selectattr('domain', 'eq', 'light')
                    | map(attribute='entity_id') | list }}
