@@ -4,7 +4,7 @@ blueprint:
     Turn lights on with presence (unless manually switched off recently),
     and off after all sensors have been clear for N minutes.
     Optional: button gestures to lock lights on (no auto-off) or off (ignore motion).
-    Lock state is kept in memory and resets to auto on restart.
+    Repeat the same gesture to unlock. Lock state resets to auto on restart.
   domain: automation
   input:
     presence_sensors:
@@ -63,6 +63,7 @@ blueprint:
               multiple: true
         lock_on_action:
           name: Lock-ON gesture
+          description: Repeat this gesture to unlock.
           default: multi_press_3
           selector:
             select:
@@ -86,16 +87,25 @@ blueprint:
               multiple: true
         lock_off_action:
           name: Lock-OFF gesture
+          description: Repeat this gesture to unlock.
           default: multi_press_3
           selector:
             select:
               custom_value: true
               options: *press_types
+        feedback_enabled:
+          name: Flash feedback
+          description: >-
+            Flash lights when the lock changes.
+            Lock on = 1 green, lock off = 2 red, unlock = 1 white.
+            Non-color lights and switches just blink.
+          default: true
+          selector:
+            boolean: {}
         feedback_lights:
           name: Feedback lights
           description: >-
-            Flash on lock. Color lights flash green (lock on) / red (lock off);
-            other lights and switches just blink. Lock on = 2 blinks, lock off = 3.
+            Leave empty to flash the target lights.
             Don't include both a smart bulb and the switch that powers it.
           default: []
           selector:
@@ -114,12 +124,16 @@ variables:
   manual_grace: !input manual_grace
   lock_on_action: !input lock_on_action
   lock_off_action: !input lock_off_action
-  feedback_lights: !input feedback_lights
+  feedback_enabled: !input feedback_enabled
+  feedback_input: !input feedback_lights
+  feedback_lights: >-
+    {{ feedback_input if feedback_input | length > 0 else target_lights }}
   lock_base: "{{ this.entity_id | replace('.', '_') }}"
   lock_mode: >-
+    {%- set scenes = states.scene | map(attribute='entity_id') | list -%}
     {%- set b = 'scene.' ~ lock_base -%}
-    {{ 'locked_on' if state_attr(b ~ '_locked_on', 'entity_id') is not none
-       else 'locked_off' if state_attr(b ~ '_locked_off', 'entity_id') is not none
+    {{ 'locked_on' if (b ~ '_locked_on') in scenes
+       else 'locked_off' if (b ~ '_locked_off') in scenes
        else 'auto' }}
 
 triggers:
@@ -158,8 +172,12 @@ actions:
           - variables:
               wanted: "{{ 'locked_on' if trigger.id == 'lock_on' else 'locked_off' }}"
               new_mode: "{{ 'auto' if lock_mode == wanted else wanted }}"
-              flash_color: "{{ [0, 255, 0] if wanted == 'locked_on' else [255, 0, 0] }}"
-              flash_count: "{{ 2 if wanted == 'locked_on' else 3 }}"
+              flash_color: >-
+                {{ [0, 255, 0] if new_mode == 'locked_on'
+                   else [255, 0, 0] if new_mode == 'locked_off'
+                   else [255, 255, 255] }}
+              flash_count: >-
+                {{ 1 if new_mode == 'locked_on' else 2 if new_mode == 'locked_off' else 1 }}
               flash_lights: >-
                 {{ expand(feedback_lights) | selectattr('domain', 'eq', 'light')
                    | map(attribute='entity_id') | list }}
@@ -169,7 +187,6 @@ actions:
               fb_was_off: >-
                 {{ expand(feedback_lights) | selectattr('state', 'eq', 'off')
                    | map(attribute='entity_id') | list }}
-              # Lights to switch back off after the flash (targets stay on if locking on)
               fb_restore_off: >-
                 {{ (fb_was_off | reject('in', target_lights) | list)
                    if new_mode == 'locked_on' else fb_was_off }}
@@ -178,7 +195,6 @@ actions:
           - if: "{{ lock_mode != 'auto' }}"
             then:
               - action: scene.delete
-                continue_on_error: true
                 target:
                   entity_id: "scene.{{ lock_base }}_{{ lock_mode }}"
           - if: "{{ new_mode != 'auto' }}"
@@ -189,7 +205,7 @@ actions:
                   snapshot_entities: "{{ target_lights }}"
 
           # ---- Flash feedback ----
-          - if: "{{ new_mode != 'auto' and feedback_lights | length > 0 }}"
+          - if: "{{ feedback_enabled and feedback_lights | length > 0 }}"
             then:
               # Turn off lights on first (in their normal color) so the snapshot
               # captures their real state and they don't "remember" the flash color
@@ -227,7 +243,7 @@ actions:
                           target:
                             entity_id: "{{ flash_switches }}"
                     - delay:
-                        milliseconds: 400
+                        milliseconds: 200
                     - if: "{{ flash_lights | length > 0 }}"
                       then:
                         - action: light.turn_off
@@ -241,7 +257,7 @@ actions:
                           target:
                             entity_id: "{{ flash_switches }}"
                     - delay:
-                        milliseconds: 300
+                        milliseconds: 150
               - action: scene.turn_on
                 target:
                   entity_id: "scene.{{ lock_base }}_flash"
