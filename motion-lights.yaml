@@ -3,6 +3,8 @@ blueprint:
   description: >-
     Turn lights on with presence (unless manually switched off recently),
     and off after all sensors have been clear for N minutes.
+    Optional: button gestures to lock lights on (no auto-off) or off (ignore motion).
+    Lock state is kept in memory and resets to auto on restart.
   domain: automation
   input:
     presence_sensors:
@@ -46,13 +48,79 @@ blueprint:
       selector:
         condition: {}
 
-mode: restart
+    lock_section:
+      name: Button lock (optional)
+      icon: mdi:lock
+      collapsed: true
+      input:
+        lock_on_buttons:
+          name: Lock-ON buttons
+          description: Matter button event entities (e.g. event.kitchen_switch_up)
+          default: []
+          selector:
+            entity:
+              domain: event
+              multiple: true
+        lock_on_action:
+          name: Lock-ON gesture
+          default: multi_press_3
+          selector:
+            select:
+              custom_value: true
+              options: &press_types
+                - multi_press_1
+                - multi_press_2
+                - multi_press_3
+                - multi_press_4
+                - multi_press_5
+                - long_press
+                - long_release
+                - initial_press
+                - short_release
+        lock_off_buttons:
+          name: Lock-OFF buttons
+          default: []
+          selector:
+            entity:
+              domain: event
+              multiple: true
+        lock_off_action:
+          name: Lock-OFF gesture
+          default: multi_press_3
+          selector:
+            select:
+              custom_value: true
+              options: *press_types
+        feedback_lights:
+          name: Feedback lights
+          description: >-
+            Flash on lock. Color lights flash green (lock on) / red (lock off);
+            other lights and switches just blink. Lock on = 2 blinks, lock off = 3.
+            Don't include both a smart bulb and the switch that powers it.
+          default: []
+          selector:
+            entity:
+              domain: [light, switch]
+              multiple: true
+
+mode: queued
+max: 10
+max_exceeded: silent
 
 variables:
   presence_sensors: !input presence_sensors
   target_lights: !input target_lights
   off_delay: !input off_delay
   manual_grace: !input manual_grace
+  lock_on_action: !input lock_on_action
+  lock_off_action: !input lock_off_action
+  feedback_lights: !input feedback_lights
+  lock_base: "{{ this.entity_id | replace('.', '_') }}"
+  lock_mode: >-
+    {%- set b = 'scene.' ~ lock_base -%}
+    {{ 'locked_on' if state_attr(b ~ '_locked_on', 'entity_id') is not none
+       else 'locked_off' if state_attr(b ~ '_locked_off', 'entity_id') is not none
+       else 'auto' }}
 
 triggers:
   - trigger: state
@@ -65,12 +133,173 @@ triggers:
     for:
       minutes: !input off_delay
     id: clear
+  - trigger: state
+    entity_id: !input lock_on_buttons
+    not_from: [unavailable, unknown]
+    not_to: [unavailable, unknown]
+    id: lock_on
+  - trigger: state
+    entity_id: !input lock_off_buttons
+    not_from: [unavailable, unknown]
+    not_to: [unavailable, unknown]
+    id: lock_off
 
 actions:
   - choose:
+      # ---- Lock gestures ----
+      - conditions:
+          - condition: trigger
+            id: [lock_on, lock_off]
+          - condition: template
+            value_template: >-
+              {{ trigger.to_state.attributes.event_type ==
+                 (lock_on_action if trigger.id == 'lock_on' else lock_off_action) }}
+        sequence:
+          - variables:
+              wanted: "{{ 'locked_on' if trigger.id == 'lock_on' else 'locked_off' }}"
+              new_mode: "{{ 'auto' if lock_mode == wanted else wanted }}"
+              flash_color: "{{ [0, 255, 0] if wanted == 'locked_on' else [255, 0, 0] }}"
+              flash_count: "{{ 2 if wanted == 'locked_on' else 3 }}"
+              flash_lights: >-
+                {{ expand(feedback_lights) | selectattr('domain', 'eq', 'light')
+                   | map(attribute='entity_id') | list }}
+              flash_switches: >-
+                {{ expand(feedback_lights) | selectattr('domain', 'eq', 'switch')
+                   | map(attribute='entity_id') | list }}
+              fb_was_off: >-
+                {{ expand(feedback_lights) | selectattr('state', 'eq', 'off')
+                   | map(attribute='entity_id') | list }}
+              # Lights to switch back off after the flash (targets stay on if locking on)
+              fb_restore_off: >-
+                {{ (fb_was_off | reject('in', target_lights) | list)
+                   if new_mode == 'locked_on' else fb_was_off }}
+
+          # ---- Store lock state as in-memory scene flags ----
+          - if: "{{ lock_mode != 'auto' }}"
+            then:
+              - action: scene.delete
+                continue_on_error: true
+                target:
+                  entity_id: "scene.{{ lock_base }}_{{ lock_mode }}"
+          - if: "{{ new_mode != 'auto' }}"
+            then:
+              - action: scene.create
+                data:
+                  scene_id: "{{ lock_base }}_{{ new_mode }}"
+                  snapshot_entities: "{{ target_lights }}"
+
+          # ---- Flash feedback ----
+          - if: "{{ new_mode != 'auto' and feedback_lights | length > 0 }}"
+            then:
+              # Turn off lights on first (in their normal color) so the snapshot
+              # captures their real state and they don't "remember" the flash color
+              - if: "{{ fb_was_off | length > 0 }}"
+                then:
+                  - action: homeassistant.turn_on
+                    target:
+                      entity_id: "{{ fb_was_off }}"
+                  - wait_template: >-
+                      {{ expand(fb_was_off) | selectattr('state', 'eq', 'off')
+                         | list | count == 0 }}
+                    timeout: "00:00:02"
+                    continue_on_timeout: true
+                  - delay:
+                      milliseconds: 300
+              - action: scene.create
+                data:
+                  scene_id: "{{ lock_base }}_flash"
+                  snapshot_entities: "{{ feedback_lights }}"
+              - repeat:
+                  count: "{{ flash_count }}"
+                  sequence:
+                    - if: "{{ flash_lights | length > 0 }}"
+                      then:
+                        - action: light.turn_on
+                          target:
+                            entity_id: "{{ flash_lights }}"
+                          data:
+                            rgb_color: "{{ flash_color }}"
+                            brightness: 255
+                            transition: 0
+                    - if: "{{ flash_switches | length > 0 }}"
+                      then:
+                        - action: switch.turn_on
+                          target:
+                            entity_id: "{{ flash_switches }}"
+                    - delay:
+                        milliseconds: 400
+                    - if: "{{ flash_lights | length > 0 }}"
+                      then:
+                        - action: light.turn_off
+                          target:
+                            entity_id: "{{ flash_lights }}"
+                          data:
+                            transition: 0
+                    - if: "{{ flash_switches | length > 0 }}"
+                      then:
+                        - action: switch.turn_off
+                          target:
+                            entity_id: "{{ flash_switches }}"
+                    - delay:
+                        milliseconds: 300
+              - action: scene.turn_on
+                target:
+                  entity_id: "scene.{{ lock_base }}_flash"
+                data:
+                  transition: 0
+              - if: "{{ fb_restore_off | length > 0 }}"
+                then:
+                  - action: homeassistant.turn_off
+                    target:
+                      entity_id: "{{ fb_restore_off }}"
+
+          # ---- Apply the new mode ----
+          - choose:
+              - conditions: "{{ new_mode == 'locked_on' }}"
+                sequence:
+                  - action: homeassistant.turn_on
+                    target:
+                      entity_id: "{{ target_lights }}"
+              - conditions: "{{ new_mode == 'locked_off' }}"
+                sequence:
+                  - action: homeassistant.turn_off
+                    target:
+                      entity_id: "{{ target_lights }}"
+              # Unlocked from locked_on: turn off now if the room's already been clear long enough
+              - conditions:
+                  - condition: template
+                    value_template: >-
+                      {% set sensors = expand(presence_sensors) %}
+                      {{ new_mode == 'auto' and wanted == 'locked_on'
+                         and sensors | selectattr('state', 'eq', 'on') | list | count == 0
+                         and sensors | selectattr('last_changed', 'gt',
+                              now() - timedelta(minutes=off_delay)) | list | count == 0 }}
+                  - condition: and
+                    conditions: !input off_conditions
+                sequence:
+                  - action: homeassistant.turn_off
+                    target:
+                      entity_id: "{{ target_lights }}"
+              # Unlocked from locked_off: turn on now if someone's there
+              - conditions:
+                  - condition: template
+                    value_template: >-
+                      {{ new_mode == 'auto' and wanted == 'locked_off'
+                         and expand(presence_sensors) | selectattr('state', 'eq', 'on')
+                             | list | count > 0 }}
+                  - condition: and
+                    conditions: !input on_conditions
+                sequence:
+                  - action: homeassistant.turn_on
+                    target:
+                      entity_id: "{{ target_lights }}"
+
+      # ---- Motion ----
       - conditions:
           - condition: trigger
             id: motion
+          - condition: template
+            value_template: "{{ lock_mode != 'locked_off' }}"
           - condition: template
             value_template: >-
               {% set lights = expand(target_lights) %}
@@ -84,10 +313,12 @@ actions:
             target:
               entity_id: "{{ target_lights }}"
 
+      # ---- Clear ----
       - conditions:
           - condition: trigger
             id: clear
-          # With multiple sensors, make sure ALL have been clear for the full delay
+          - condition: template
+            value_template: "{{ lock_mode != 'locked_on' }}"
           - condition: template
             value_template: >-
               {% set sensors = expand(presence_sensors) %}
