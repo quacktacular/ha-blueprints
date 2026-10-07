@@ -97,7 +97,8 @@ blueprint:
           name: Flash feedback
           description: >-
             Flash lights when the lock changes.
-            Lock on = 1 green, lock off = 2 red, unlock = 1 white.
+            Lock on = 1 green, lock off = 2 red,
+            unlock = 1 blink in the light's own color.
             Non-color lights and switches just blink.
           default: true
           selector:
@@ -129,12 +130,6 @@ variables:
   feedback_lights: >-
     {{ feedback_input if feedback_input | length > 0 else target_lights }}
   lock_base: "{{ this.entity_id | replace('.', '_') }}"
-  lock_mode: >-
-    {%- set scenes = states.scene | map(attribute='entity_id') | list -%}
-    {%- set b = 'scene.' ~ lock_base -%}
-    {{ 'locked_on' if (b ~ '_locked_on') in scenes
-       else 'locked_off' if (b ~ '_locked_off') in scenes
-       else 'auto' }}
 
 triggers:
   - trigger: state
@@ -159,6 +154,16 @@ triggers:
     id: lock_off
 
 actions:
+  # Read lock state when the run actually starts (not at trigger time),
+  # so queued runs never act on stale state
+  - variables:
+      lock_mode: >-
+        {%- set scenes = states.scene | map(attribute='entity_id') | list -%}
+        {%- set b = 'scene.' ~ lock_base -%}
+        {{ 'locked_on' if (b ~ '_locked_on') in scenes
+           else 'locked_off' if (b ~ '_locked_off') in scenes
+           else 'auto' }}
+
   - choose:
       # ---- Lock gestures ----
       - conditions:
@@ -168,16 +173,18 @@ actions:
             value_template: >-
               {{ trigger.to_state.attributes.event_type ==
                  (lock_on_action if trigger.id == 'lock_on' else lock_off_action) }}
+          # Ignore duplicate events (some switches send each multi-press twice)
+          - condition: template
+            value_template: >-
+              {{ trigger.from_state.attributes.event_type != trigger.to_state.attributes.event_type
+                 or (as_timestamp(trigger.to_state.state)
+                     - as_timestamp(trigger.from_state.state)) > 1 }}
         sequence:
           - variables:
               wanted: "{{ 'locked_on' if trigger.id == 'lock_on' else 'locked_off' }}"
               new_mode: "{{ 'auto' if lock_mode == wanted else wanted }}"
-              flash_color: >-
-                {{ [0, 255, 0] if new_mode == 'locked_on'
-                   else [255, 0, 0] if new_mode == 'locked_off'
-                   else [255, 255, 255] }}
-              flash_count: >-
-                {{ 1 if new_mode == 'locked_on' else 2 if new_mode == 'locked_off' else 1 }}
+              flash_color: "{{ [0, 255, 0] if new_mode == 'locked_on' else [255, 0, 0] }}"
+              flash_count: "{{ 1 if new_mode == 'locked_on' else 2 }}"
               flash_lights: >-
                 {{ expand(feedback_lights) | selectattr('domain', 'eq', 'light')
                    | map(attribute='entity_id') | list }}
@@ -190,6 +197,8 @@ actions:
               fb_restore_off: >-
                 {{ (fb_was_off | reject('in', target_lights) | list)
                    if new_mode == 'locked_on' else fb_was_off }}
+              fb_was_on_lights: "{{ flash_lights | reject('in', fb_was_off) | list }}"
+              fb_was_on_switches: "{{ flash_switches | reject('in', fb_was_off) | list }}"
 
           # ---- Store lock state as in-memory scene flags ----
           - if: "{{ lock_mode != 'auto' }}"
@@ -208,7 +217,7 @@ actions:
           - if: "{{ feedback_enabled and feedback_lights | length > 0 }}"
             then:
               # Turn off lights on first (in their normal color) so the snapshot
-              # captures their real state and they don't "remember" the flash color
+              # captures their real state
               - if: "{{ fb_was_off | length > 0 }}"
                 then:
                   - action: homeassistant.turn_on
@@ -225,44 +234,71 @@ actions:
                 data:
                   scene_id: "{{ lock_base }}_flash"
                   snapshot_entities: "{{ feedback_lights }}"
-              - repeat:
-                  count: "{{ flash_count }}"
-                  sequence:
-                    - if: "{{ flash_lights | length > 0 }}"
-                      then:
-                        - action: light.turn_on
-                          target:
-                            entity_id: "{{ flash_lights }}"
-                          data:
-                            rgb_color: "{{ flash_color }}"
-                            brightness: 255
-                            transition: 0
-                    - if: "{{ flash_switches | length > 0 }}"
-                      then:
-                        - action: switch.turn_on
-                          target:
-                            entity_id: "{{ flash_switches }}"
-                    - delay:
-                        milliseconds: 200
-                    - if: "{{ flash_lights | length > 0 }}"
-                      then:
-                        - action: light.turn_off
-                          target:
-                            entity_id: "{{ flash_lights }}"
-                          data:
-                            transition: 0
-                    - if: "{{ flash_switches | length > 0 }}"
-                      then:
-                        - action: switch.turn_off
-                          target:
-                            entity_id: "{{ flash_switches }}"
-                    - delay:
-                        milliseconds: 150
+              - if: "{{ new_mode == 'auto' }}"
+                # Unlock: one blink in each light's own color
+                # (lights that were on blink off; lights that were off already
+                # blinked on via the step above)
+                then:
+                  - if: "{{ fb_was_on_lights | length > 0 }}"
+                    then:
+                      - action: light.turn_off
+                        target:
+                          entity_id: "{{ fb_was_on_lights }}"
+                        data:
+                          transition: 0
+                  - if: "{{ fb_was_on_switches | length > 0 }}"
+                    then:
+                      - action: switch.turn_off
+                        target:
+                          entity_id: "{{ fb_was_on_switches }}"
+                  - delay:
+                      milliseconds: 200
+                # Lock on/off: green/red blinks
+                else:
+                  - repeat:
+                      count: "{{ flash_count }}"
+                      sequence:
+                        - if: "{{ flash_lights | length > 0 }}"
+                          then:
+                            - action: light.turn_on
+                              target:
+                                entity_id: "{{ flash_lights }}"
+                              data:
+                                rgb_color: "{{ flash_color }}"
+                                brightness: 255
+                                transition: 0
+                        - if: "{{ flash_switches | length > 0 }}"
+                          then:
+                            - action: switch.turn_on
+                              target:
+                                entity_id: "{{ flash_switches }}"
+                        - delay:
+                            milliseconds: 200
+                        # Leave lights ON after the last blink so the restore applies while on
+                        # (Matter bulbs often ignore color changes while off)
+                        - if: "{{ repeat.index < flash_count | int }}"
+                          then:
+                            - if: "{{ flash_lights | length > 0 }}"
+                              then:
+                                - action: light.turn_off
+                                  target:
+                                    entity_id: "{{ flash_lights }}"
+                                  data:
+                                    transition: 0
+                            - if: "{{ flash_switches | length > 0 }}"
+                              then:
+                                - action: switch.turn_off
+                                  target:
+                                    entity_id: "{{ flash_switches }}"
+                            - delay:
+                                milliseconds: 150
               - action: scene.turn_on
                 target:
                   entity_id: "scene.{{ lock_base }}_flash"
                 data:
                   transition: 0
+              - delay:
+                  milliseconds: 300
               - if: "{{ fb_restore_off | length > 0 }}"
                 then:
                   - action: homeassistant.turn_off
