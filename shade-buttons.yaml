@@ -1,0 +1,264 @@
+blueprint:
+  name: Shade buttons
+  description: >-
+    Control shades with up/down buttons. Tap to nudge a step, hold to move
+    until released, double-tap to fully open or close. Each gesture is optional
+    and configurable. Quick repeated taps stack (tap 3x = 3 steps), even while
+    the shade is still moving.
+    Check the button's event_types attribute (Developer Tools > States) to see
+    which gestures it supports. If two features share a gesture, the first of
+    tap / hold / release / full wins.
+  domain: automation
+  homeassistant:
+    min_version: 2026.8.0
+  input:
+    target_shades:
+      name: Shades
+      selector:
+        entity:
+          domain: cover
+          multiple: true
+    up_buttons:
+      name: Up buttons
+      description: Matter button event entities (e.g. event.bedroom_remote_button_1)
+      default: []
+      selector:
+        entity:
+          domain: event
+          multiple: true
+    down_buttons:
+      name: Down buttons
+      default: []
+      selector:
+        entity:
+          domain: event
+          multiple: true
+
+    step_section:
+      name: Tap to nudge
+      icon: mdi:arrow-up-down
+      input:
+        step_gesture:
+          name: Nudge gesture
+          default: multi_press_1
+          selector:
+            select:
+              custom_value: true
+              options: &gestures
+                - label: Disabled
+                  value: none
+                - label: Single press (multi_press_1)
+                  value: multi_press_1
+                - label: Double press (multi_press_2)
+                  value: multi_press_2
+                - label: Triple press (multi_press_3)
+                  value: multi_press_3
+                - label: Quadruple press (multi_press_4)
+                  value: multi_press_4
+                - label: Quintuple press (multi_press_5)
+                  value: multi_press_5
+                - label: Hold (long_press)
+                  value: long_press
+                - label: Release after hold (long_release)
+                  value: long_release
+                - label: Press down (initial_press)
+                  value: initial_press
+                - label: Release after press (short_release)
+                  value: short_release
+        step_size:
+          name: Step size
+          default: 10
+          selector:
+            number:
+              min: 1
+              max: 50
+              unit_of_measurement: "%"
+        step_memory:
+          name: Stack taps within (seconds)
+          description: >-
+            A tap this soon after the last one steps from where the shade is
+            heading, not where it is right now. Tapping the other direction
+            always steps from the current position. 0 = never stack.
+          default: 10
+          selector:
+            number:
+              min: 0
+              max: 60
+              unit_of_measurement: s
+
+    hold_section:
+      name: Hold to move
+      icon: mdi:gesture-tap-hold
+      collapsed: true
+      input:
+        hold_gesture:
+          name: Start moving gesture
+          default: long_press
+          selector:
+            select:
+              custom_value: true
+              options: *gestures
+        release_gesture:
+          name: Stop moving gesture
+          description: Sent from either button, stops all shades.
+          default: long_release
+          selector:
+            select:
+              custom_value: true
+              options: *gestures
+
+    full_section:
+      name: Fully open / close
+      icon: mdi:arrow-collapse-vertical
+      collapsed: true
+      input:
+        full_gesture:
+          name: Fully open / close gesture
+          default: multi_press_2
+          selector:
+            select:
+              custom_value: true
+              options: *gestures
+
+mode: queued
+max: 10
+max_exceeded: silent
+trace:
+  stored_traces: 50
+
+variables:
+  target_shades: !input target_shades
+  step_gesture: !input step_gesture
+  step_size: !input step_size
+  step_memory: !input step_memory
+  hold_gesture: !input hold_gesture
+  release_gesture: !input release_gesture
+  full_gesture: !input full_gesture
+  # In-memory store of where each shade is heading (lost on restart, which is fine)
+  memory_id: "{{ this.entity_id | replace('.', '_') }}_targets"
+  memory_scene: "scene.{{ memory_id }}"
+
+triggers:
+  - trigger: event.received
+    target:
+      entity_id: !input up_buttons
+    options:
+      event_type:
+        - !input step_gesture
+        - !input hold_gesture
+        - !input release_gesture
+        - !input full_gesture
+    id: up
+  - trigger: event.received
+    target:
+      entity_id: !input down_buttons
+    options:
+      event_type:
+        - !input step_gesture
+        - !input hold_gesture
+        - !input release_gesture
+        - !input full_gesture
+    id: down
+
+actions:
+  # Ignore manual runs, and duplicate events (some switches send each press twice).
+  # Window is short so quick deliberate taps still count.
+  - condition: template
+    value_template: >-
+      {{ trigger.to_state is defined
+         and (trigger.from_state.attributes.event_type != trigger.to_state.attributes.event_type
+              or (as_timestamp(trigger.to_state.state)
+                  - as_timestamp(trigger.from_state.state, 0)) > 0.3) }}
+
+  - variables:
+      gesture: "{{ trigger.to_state.attributes.event_type }}"
+      going_up: "{{ trigger.id == 'up' }}"
+      command: >-
+        {{ 'step' if gesture == step_gesture
+           else 'hold' if gesture == hold_gesture
+           else 'release' if gesture == release_gesture
+           else 'full' if gesture == full_gesture
+           else 'none' }}
+      # Read memory when the run starts (not at trigger time), so queued taps build on each other
+      memory_exists: "{{ memory_scene in (states.scene | map(attribute='entity_id') | list) }}"
+      memory: >-
+        {{ state_attr(memory_scene, 'entity_id')
+           if memory_exists and command == 'step'
+              and (now() - states[memory_scene].last_changed).total_seconds() < step_memory
+           else [] }}
+
+  # Anything other than a tap makes remembered targets meaningless
+  - if: "{{ command != 'step' and memory_exists }}"
+    then:
+      - action: scene.delete
+        target:
+          entity_id: "{{ memory_scene }}"
+
+  - choose:
+      # ---- Tap: nudge one step ----
+      - conditions: "{{ command == 'step' }}"
+        sequence:
+          - variables:
+              delta: "{{ step_size if going_up else -step_size }}"
+              # Memory entries look like shade_target.<shade object id>_at_<position>
+              plan: >-
+                {% set ns = namespace(items=[], prev=none) %}
+                {% for s in target_shades %}
+                  {% set pos = state_attr(s, 'current_position') %}
+                  {% if pos is number %}
+                    {% set key = 'shade_target.' ~ s.split('.')[1] %}
+                    {% set ns.prev = none %}
+                    {% for m in memory if m.rsplit('_at_', 1)[0] == key %}
+                      {% set ns.prev = m.rsplit('_at_', 1)[1] | int %}
+                    {% endfor %}
+                    {# Only build on a remembered target that's still ahead in this direction #}
+                    {% set base = ns.prev if ns.prev is not none and (ns.prev - pos) * delta > 0
+                                  else pos %}
+                    {% set target = [0, [100, base + delta] | min] | max %}
+                    {% set ns.items = ns.items + [{'entity_id': s, 'from': pos, 'to': target,
+                                                   'memory': key ~ '_at_' ~ target}] %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.items }}
+              # Shades going to the same position share one call so they move together
+              moves: >-
+                {% set ns = namespace(groups=[]) %}
+                {% for g in plan | groupby('to') %}
+                  {% set ids = g.list | selectattr('from', 'ne', g.grouper)
+                               | map(attribute='entity_id') | list %}
+                  {% if ids | count > 0 %}
+                    {% set ns.groups = ns.groups + [{'position': g.grouper, 'entities': ids}] %}
+                  {% endif %}
+                {% endfor %}
+                {{ ns.groups }}
+          - repeat:
+              for_each: "{{ moves }}"
+              sequence:
+                - action: cover.set_cover_position
+                  target:
+                    entity_id: "{{ repeat.item.entities }}"
+                  data:
+                    position: "{{ repeat.item.position }}"
+          # Remember where each shade is heading, for the next quick tap
+          - if: "{{ plan | count > 0 and step_memory > 0 }}"
+            then:
+              - action: scene.create
+                data:
+                  scene_id: "{{ memory_id }}"
+                  entities: >-
+                    {% set names = plan | map(attribute='memory') | list %}
+                    {{ dict(zip(names, ['remembered'] * names | count)) }}
+
+      # ---- Hold, or fully open / close: start moving ----
+      - conditions: "{{ command in ['hold', 'full'] }}"
+        sequence:
+          - action: "{{ 'cover.open_cover' if going_up else 'cover.close_cover' }}"
+            target:
+              entity_id: "{{ target_shades }}"
+
+      # ---- Release after hold: stop ----
+      - conditions: "{{ command == 'release' }}"
+        sequence:
+          - action: cover.stop_cover
+            target:
+              entity_id: "{{ target_shades }}"
