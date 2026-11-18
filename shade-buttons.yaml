@@ -67,7 +67,7 @@ blueprint:
                   value: short_release
         step_size:
           name: Step size
-          default: 10
+          default: 5
           selector:
             number:
               min: 1
