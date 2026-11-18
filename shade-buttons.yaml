@@ -147,11 +147,6 @@ variables:
   # In-memory store of where each shade is heading (lost on restart, which is fine)
   memory_id: "{{ this.entity_id | replace('.', '_') }}_targets"
   memory_scene: "scene.{{ memory_id }}"
-  # Some shades (e.g. SmartWings) report their destination as their position while
-  # moving, and only report where they really stopped several seconds after a stop.
-  # A tap within stop_window seconds of a stop waits up to settle_timeout for that report.
-  stop_window: 30
-  settle_timeout: 15
 
 triggers:
   - trigger: event.received
@@ -195,16 +190,12 @@ actions:
            else 'full' if gesture == full_gesture
            else 'none' }}
       # Read memory when the run starts (not at trigger time), so queued taps build on each other
-      # Entries: shade_target.<shade>_at_<pos> after a tap, shade_stopped.<shade>_at_<pos> after a stop
       memory_exists: "{{ memory_scene in (states.scene | map(attribute='entity_id') | list) }}"
-      memory_age: >-
-        {{ (now() - states[memory_scene].last_changed).total_seconds() if memory_exists else 9999 }}
       memory: >-
-        {{ state_attr(memory_scene, 'entity_id') | select('match', 'shade_target') | list
-           if command == 'step' and memory_age < step_memory else [] }}
-      stopped: >-
-        {{ state_attr(memory_scene, 'entity_id') | select('match', 'shade_stopped') | list
-           if command == 'step' and memory_age < stop_window else [] }}
+        {{ state_attr(memory_scene, 'entity_id')
+           if memory_exists and command == 'step'
+              and (now() - states[memory_scene].last_changed).total_seconds() < step_memory
+           else [] }}
 
   # Anything other than a tap makes remembered targets meaningless
   - if: "{{ command != 'step' and memory_exists }}"
@@ -217,21 +208,6 @@ actions:
       # ---- Tap: nudge one step ----
       - conditions: "{{ command == 'step' }}"
         sequence:
-          # Just after a stop, wait until the shades report where they actually stopped
-          - if: "{{ stopped | count > 0 }}"
-            then:
-              - wait_template: >-
-                  {% set ns = namespace(settled=true) %}
-                  {% for m in stopped %}
-                    {% set shade, pos = m.split('.', 1)[1].rsplit('_at_', 1) %}
-                    {% if state_attr('cover.' ~ shade, 'current_position') == pos | int %}
-                      {% set ns.settled = false %}
-                    {% endif %}
-                  {% endfor %}
-                  {{ ns.settled }}
-                timeout:
-                  seconds: "{{ settle_timeout }}"
-                continue_on_timeout: true
           - variables:
               delta: "{{ step_size if going_up else -step_size }}"
               # Memory entries look like shade_target.<shade object id>_at_<position>
@@ -297,24 +273,6 @@ actions:
       # ---- Release after hold: stop ----
       - conditions: "{{ command == 'release' }}"
         sequence:
-          # Note the (possibly stale) positions so the next tap can wait for real ones.
-          # Read before stopping, so a quick real report can't be mistaken for the stale one.
-          - variables:
-              stop_marks: >-
-                {% set ns = namespace(names=[]) %}
-                {% for s in target_shades %}
-                  {% set pos = state_attr(s, 'current_position') %}
-                  {% if pos is number %}
-                    {% set ns.names = ns.names + ['shade_stopped.' ~ s.split('.')[1] ~ '_at_' ~ pos] %}
-                  {% endif %}
-                {% endfor %}
-                {{ ns.names }}
           - action: cover.stop_cover
             target:
               entity_id: "{{ target_shades }}"
-          - if: "{{ stop_marks | count > 0 }}"
-            then:
-              - action: scene.create
-                data:
-                  scene_id: "{{ memory_id }}"
-                  entities: "{{ dict(zip(stop_marks, ['remembered'] * stop_marks | count)) }}"
