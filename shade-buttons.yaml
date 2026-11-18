@@ -18,6 +18,15 @@ blueprint:
         entity:
           domain: cover
           multiple: true
+    sync_shades:
+      name: Keep shades in sync
+      description: >-
+        Taps move every shade to the same position, stepping from their average,
+        so shades that have drifted apart line back up on the first tap.
+        Off = each shade steps from its own position.
+      default: true
+      selector:
+        boolean: {}
     up_buttons:
       name: Up buttons
       description: Matter button event entities (e.g. event.bedroom_remote_button_1)
@@ -67,7 +76,7 @@ blueprint:
                   value: short_release
         step_size:
           name: Step size
-          default: 5
+          default: 10
           selector:
             number:
               min: 1
@@ -79,7 +88,7 @@ blueprint:
             A tap this soon after the last one steps from where the shade is
             heading, not where it is right now. Tapping the other direction
             always steps from the current position. 0 = never stack.
-          default: 10
+          default: 5
           selector:
             number:
               min: 0
@@ -128,6 +137,7 @@ trace:
 
 variables:
   target_shades: !input target_shades
+  sync_shades: !input sync_shades
   step_gesture: !input step_gesture
   step_size: !input step_size
   step_memory: !input step_memory
@@ -202,10 +212,14 @@ actions:
               delta: "{{ step_size if going_up else -step_size }}"
               # Memory entries look like shade_target.<shade object id>_at_<position>
               plan: >-
+                {% set positions = target_shades | map('state_attr', 'current_position')
+                                   | select('number') | list %}
+                {% set avg = (positions | average) | round | int if positions else none %}
                 {% set ns = namespace(items=[], prev=none) %}
                 {% for s in target_shades %}
-                  {% set pos = state_attr(s, 'current_position') %}
-                  {% if pos is number %}
+                  {% set actual = state_attr(s, 'current_position') %}
+                  {% set pos = avg if sync_shades else actual %}
+                  {% if actual is number %}
                     {% set key = 'shade_target.' ~ s.split('.')[1] %}
                     {% set ns.prev = none %}
                     {% for m in memory if m.rsplit('_at_', 1)[0] == key %}
@@ -215,7 +229,7 @@ actions:
                     {% set base = ns.prev if ns.prev is not none and (ns.prev - pos) * delta > 0
                                   else pos %}
                     {% set target = [0, [100, base + delta] | min] | max %}
-                    {% set ns.items = ns.items + [{'entity_id': s, 'from': pos, 'to': target,
+                    {% set ns.items = ns.items + [{'entity_id': s, 'from': actual, 'to': target,
                                                    'memory': key ~ '_at_' ~ target}] %}
                   {% endif %}
                 {% endfor %}
