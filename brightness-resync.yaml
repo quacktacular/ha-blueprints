@@ -1,0 +1,75 @@
+blueprint:
+  name: Brightness resync
+  description: >-
+    Works around lights that report a brightness but don't actually apply it
+    when a scene from another controller (e.g. Apple Home) changes power,
+    colour temp and brightness at the same time.
+    When a light's brightness changes from outside HA and is above 1%,
+    nudge it down by 1% and then set it back to the reported value.
+    Changes made by HA (including this automation) are ignored.
+  domain: automation
+  input:
+    target_lights:
+      name: Lights
+      selector:
+        entity:
+          domain: light
+          multiple: true
+    first_delay:
+      name: Delay before nudge (ms)
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 5000
+          step: 50
+          unit_of_measurement: ms
+    second_delay:
+      name: Delay before restore (ms)
+      default: 0
+      selector:
+        number:
+          min: 0
+          max: 5000
+          step: 50
+          unit_of_measurement: ms
+
+mode: parallel
+max: 25
+
+triggers:
+  - trigger: state
+    entity_id: !input target_lights
+    attribute: brightness
+
+conditions:
+  # Not from HA: HA-originated changes carry a user_id (UI) or parent_id (automations/scripts)
+  - condition: template
+    value_template: >-
+      {{ trigger.to_state.context.user_id is none
+         and trigger.to_state.context.parent_id is none }}
+  - condition: template
+    value_template: >-
+      {{ trigger.from_state is not none
+         and trigger.from_state.state not in ['unavailable', 'unknown']
+         and trigger.to_state.state == 'on'
+         and ((trigger.to_state.attributes.brightness | int(0)) / 2.55) | round(0) > 1 }}
+
+actions:
+  - variables:
+      brightness: "{{ trigger.to_state.attributes.brightness | int }}"
+      nudge_pct: "{{ ((brightness / 2.55) | round(0) | int) - 1 }}"
+  - delay:
+      milliseconds: !input first_delay
+  - action: light.turn_on
+    target:
+      entity_id: "{{ trigger.entity_id }}"
+    data:
+      brightness_pct: "{{ nudge_pct }}"
+  - delay:
+      milliseconds: !input second_delay
+  - action: light.turn_on
+    target:
+      entity_id: "{{ trigger.entity_id }}"
+    data:
+      brightness: "{{ brightness }}"
