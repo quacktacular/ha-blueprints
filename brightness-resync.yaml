@@ -6,6 +6,7 @@ blueprint:
     colour temp and brightness at the same time.
     When a light's brightness changes from outside HA and is above 1%,
     nudge it down by 1% and then set it back to the reported value.
+    Each step waits for the light to report the change and resends if it doesn't.
     Changes made by HA (including this automation) are ignored.
   domain: automation
   input:
@@ -33,6 +34,24 @@ blueprint:
           max: 5000
           step: 50
           unit_of_measurement: ms
+    confirm_timeout:
+      name: Wait for light to confirm (ms)
+      description: How long to wait for the light to report each change before resending.
+      default: 1000
+      selector:
+        number:
+          min: 100
+          max: 5000
+          step: 50
+          unit_of_measurement: ms
+    max_attempts:
+      name: Max attempts per step
+      default: 3
+      selector:
+        number:
+          min: 1
+          max: 10
+          step: 1
 
 mode: parallel
 max: 25
@@ -59,17 +78,34 @@ actions:
   - variables:
       brightness: "{{ trigger.to_state.attributes.brightness | int }}"
       nudge_pct: "{{ ((brightness / 2.55) | round(0) | int) - 1 }}"
+      max_attempts: !input max_attempts
   - delay:
       milliseconds: !input first_delay
-  - action: light.turn_on
-    target:
-      entity_id: "{{ trigger.entity_id }}"
-    data:
-      brightness_pct: "{{ nudge_pct }}"
+  # Nudge down, resending until the light reports a different brightness
+  - repeat:
+      sequence:
+        - action: light.turn_on
+          target:
+            entity_id: "{{ trigger.entity_id }}"
+          data:
+            brightness_pct: "{{ nudge_pct }}"
+        - wait_template: >-
+            {{ state_attr(trigger.entity_id, 'brightness') | int(0) != brightness }}
+          timeout:
+            milliseconds: !input confirm_timeout
+      until: "{{ wait.completed or repeat.index >= max_attempts | int }}"
   - delay:
       milliseconds: !input second_delay
-  - action: light.turn_on
-    target:
-      entity_id: "{{ trigger.entity_id }}"
-    data:
-      brightness: "{{ brightness }}"
+  # Restore, resending until the light reports the original brightness
+  - repeat:
+      sequence:
+        - action: light.turn_on
+          target:
+            entity_id: "{{ trigger.entity_id }}"
+          data:
+            brightness: "{{ brightness }}"
+        - wait_template: >-
+            {{ state_attr(trigger.entity_id, 'brightness') | int(0) == brightness }}
+          timeout:
+            milliseconds: !input confirm_timeout
+      until: "{{ wait.completed or repeat.index >= max_attempts | int }}"
